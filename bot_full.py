@@ -1,0 +1,1277 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+ Instagram Account Status Monitor — Telegram Bot (Advanced)
+================================================================================
+
+Feature parity with the Discord "Advanced" bot, adapted to Telegram's DM-only
+model (no channel routing — everything happens in the bot chat itself, as
+requested):
+
+  - Instagram-style stat cards (real avatar, Follow/Message pills, posts /
+    followers / following, verified checkmark, muted "UserNotFound" card for
+    bans / not-found lookups)
+  - Bulk adding (unchanged from before — one username per line or comma-sep)
+  - Verification monitoring — OPT-IN per account via a dedicated "🔐 Verify
+    Add" flow, separate from the normal Add flow, so adding a verified
+    account for ban/unban monitoring never fires a surprise "verified" alert
+  - Redis-backed persistence (Upstash free tier) so data survives
+    restarts/redeploys on hosts with no persistent disk (e.g. Render free
+    tier) — falls back to local JSON files automatically if unset
+  - "Account has been wiped" / "Account has returned from the grave" premium
+    phrasing, time-taken on every alert type, custom/premium Telegram emoji
+    support, branded footer
+  - /preview — test-only rendering of any alert type, clearly marked, so you
+    can see the format without needing a real ban/unban/verification event
+
+DETECTION METHOD / KNOWN LIMITATIONS: unchanged from before — see the
+original notes retained below.
+
+KNOWN LIMITATION (please read):
+  InstaNavigation's backend appears to cache profile data server-side,
+  shared across all callers (not per-visitor). In testing, this caused
+  roughly a ~2 hour delay between a real status change and this bot
+  detecting it. This is a limitation of the underlying data source, not
+  something fixable in this code — there is no cache-busting parameter
+  available in their API.
+
+HOW TO RUN LOCALLY:
+  pip install -r requirements.txt
+  cp .env.example .env   (fill in BOT_TOKEN, AUTHORIZED_CHAT_IDS)
+  python bot_full.py
+
+HOW TO DEPLOY (Docker / Render): unchanged — see Dockerfile.
+================================================================================
+"""
+
+import os
+import re
+import io
+import json
+import uuid
+import asyncio
+import logging
+import random
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+import aiohttp
+from aiohttp import web
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.error import TelegramError, Forbidden, BadRequest
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "20"))
+CONFIRMATION_THRESHOLD = int(os.getenv("CONFIRMATION_THRESHOLD", "2"))
+PORT = int(os.getenv("PORT", "8080"))
+
+DATA_FILE = Path(os.getenv("DATA_FILE", "monitored_accounts.json"))
+CARDS_DIR = Path(os.getenv("CARDS_DIR", "cards"))
+CARDS_DIR.mkdir(parents=True, exist_ok=True)
+
+BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring").strip()
+BOT_SIGNATURE = os.getenv("BOT_SIGNATURE", "").strip()
+
+INTER_CHECK_DELAY_MS = 2000
+MAX_BULK_ADD = 25  # safety cap so one paste can't queue an unbounded number of checks
+
+API_URL = "https://insta-story.com/api/v1/web/profile"
+
+if not BOT_TOKEN:
+    raise SystemExit("ERROR: BOT_TOKEN is not set in .env")
+
+# ============================================================================
+# AUTHORIZATION WITH TIME-LIMITED ACCESS (unchanged)
+# ============================================================================
+def parse_duration(duration_str: str) -> Optional[timedelta]:
+    match = re.fullmatch(r"(\d+)([dhm])", duration_str.strip())
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2)
+    if unit == "d":
+        return timedelta(days=value)
+    elif unit == "h":
+        return timedelta(hours=value)
+    elif unit == "m":
+        return timedelta(minutes=value)
+    return None
+
+_raw_chat_ids = os.getenv("AUTHORIZED_CHAT_IDS", "").strip()
+_bot_start_time = datetime.now(timezone.utc)
+
+AUTHORIZED_USERS: dict = {}
+for entry in _raw_chat_ids.split(","):
+    entry = entry.strip()
+    if not entry:
+        continue
+    if ":" in entry:
+        uid_str, duration_str = entry.split(":", 1)
+        duration = parse_duration(duration_str)
+        AUTHORIZED_USERS[int(uid_str)] = (_bot_start_time + duration) if duration else None
+    else:
+        AUTHORIZED_USERS[int(entry)] = None
+
+if not AUTHORIZED_USERS:
+    raise SystemExit("ERROR: AUTHORIZED_CHAT_IDS is not set in .env")
+
+def is_authorized(user_id: int) -> bool:
+    if user_id not in AUTHORIZED_USERS:
+        return False
+    expiry = AUTHORIZED_USERS[user_id]
+    if expiry is None:
+        return True
+    return datetime.now(timezone.utc) < expiry
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logger = logging.getLogger("igbot")
+
+# ============================================================================
+# PERSISTENCE — Upstash Redis (free tier, survives restarts/redeploys) with
+# automatic fallback to local JSON files if the env vars aren't set. Same
+# approach as the Discord bots use, so data reliability isn't tied to
+# whichever host has a persistent disk available.
+# ============================================================================
+_storage_lock = asyncio.Lock()
+
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+USE_REDIS = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+ACCOUNTS_REDIS_KEY = os.getenv("ACCOUNTS_REDIS_KEY", "igbot:monitored_accounts")
+
+if USE_REDIS:
+    logger.info("Persistence backend: Upstash Redis")
+else:
+    logger.warning(
+        "Persistence backend: local JSON files (UPSTASH_REDIS_REST_URL/TOKEN "
+        "not set). On a host with no persistent disk (e.g. Render free tier) "
+        "this data will NOT survive a restart or redeploy."
+    )
+
+def _validate_data(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for user_key, user_accounts in data.items():
+        if not isinstance(user_key, str) or not user_key.startswith("user_"):
+            return False
+        if not isinstance(user_accounts, dict):
+            return False
+        for account_key, entry in user_accounts.items():
+            if not isinstance(entry, dict):
+                return False
+            for field in ["username", "status", "last_checked", "case_index"]:
+                if field not in entry:
+                    return False
+    return True
+
+async def _redis_command(*args) -> Optional[dict]:
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(UPSTASH_REDIS_REST_URL, json=list(args), headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"Redis command failed ({resp.status}): {body[:200]}")
+                    return None
+                return await resp.json()
+    except Exception as e:
+        logger.error(f"Redis command error: {e}")
+        return None
+
+async def _redis_get_json(key: str) -> dict:
+    result = await _redis_command("GET", key)
+    if not result or result.get("result") is None:
+        return {}
+    try:
+        return json.loads(result["result"])
+    except (json.JSONDecodeError, TypeError):
+        logger.error(f"Corrupt JSON in Redis key {key}, starting fresh.")
+        return {}
+
+async def _redis_set_json(key: str, data: dict) -> bool:
+    result = await _redis_command("SET", key, json.dumps(data, ensure_ascii=False))
+    ok = bool(result and result.get("result") == "OK")
+    if not ok:
+        logger.error(f"Failed to save Redis key {key}")
+    return ok
+
+def _load_data_file() -> dict:
+    if not DATA_FILE.exists():
+        logger.info(f"Data file {DATA_FILE} does not exist yet.")
+        return {}
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"Loaded data file with {len(data)} users.")
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Failed to load data file: {e}. Starting fresh.")
+        return {}
+
+def _save_data_file(data: dict) -> None:
+    tmp_path = DATA_FILE.with_suffix(".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(DATA_FILE)
+        logger.info(f"Successfully saved data file with {len(data)} users.")
+    except OSError as e:
+        logger.error(f"Failed to save data file: {e}")
+
+async def load_data() -> dict:
+    async with _storage_lock:
+        if USE_REDIS:
+            return await _redis_get_json(ACCOUNTS_REDIS_KEY)
+        return _load_data_file()
+
+async def save_data(data: dict) -> None:
+    async with _storage_lock:
+        if not _validate_data(data):
+            logger.error("Data validation failed! Not saving to prevent corruption.")
+            return
+        if USE_REDIS:
+            await _redis_set_json(ACCOUNTS_REDIS_KEY, data)
+        else:
+            _save_data_file(data)
+
+def get_user_key(user_id: int) -> str:
+    return f"user_{user_id}"
+
+# ============================================================================
+# HELPER: Human-Readable Time (unchanged)
+# ============================================================================
+def relative_time(iso_timestamp: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_timestamp)
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        if delta.total_seconds() < 60:
+            return "just now"
+        elif delta.total_seconds() < 3600:
+            minutes = int(delta.total_seconds() // 60)
+            return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+        elif delta.total_seconds() < 86400:
+            hours = int(delta.total_seconds() // 3600)
+            return f"{hours} hour{'s' if hours > 1 else ''} ago"
+        else:
+            days = int(delta.total_seconds() // 86400)
+            return f"{days} day{'s' if days > 1 else ''} ago"
+    except Exception:
+        return "unknown"
+
+def format_username_link(username: str) -> str:
+    return f'<a href="https://instagram.com/{username}">@{username}</a>'
+
+def format_duration_hm(seconds: float) -> str:
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours}h {minutes}m"
+
+def compute_time_taken(entry: dict) -> Optional[str]:
+    added_at_str = entry.get("added_at")
+    if not added_at_str:
+        return None
+    try:
+        added_at = datetime.fromisoformat(added_at_str)
+        elapsed = (datetime.now(timezone.utc) - added_at).total_seconds()
+        return format_duration_hm(elapsed)
+    except Exception:
+        return None
+
+def count_alpha_chars(username: str) -> int:
+    return sum(1 for c in username if c.isalpha())
+
+def generate_case_variant(original_username: str, case_index: int) -> str:
+    letters = count_alpha_chars(original_username)
+    if letters == 0:
+        return original_username
+    total = 1 << letters
+    case_index %= total
+    result = []
+    bit_pos = 0
+    for ch in original_username:
+        if ch.isalpha():
+            if (case_index >> bit_pos) & 1:
+                result.append(ch.upper())
+            else:
+                result.append(ch.lower())
+            bit_pos += 1
+        else:
+            result.append(ch)
+    return "".join(result)
+
+def next_case_index(original_username: str, current_index: int) -> int:
+    letters = count_alpha_chars(original_username)
+    if letters == 0:
+        return 0
+    total = 1 << letters
+    return (current_index + 1) % total
+
+# ============================================================================
+# CUSTOM / PREMIUM EMOJI (optional)
+#
+# EMOJI_<KEY> env var can hold either a plain unicode emoji (used as-is) or
+# a numeric Telegram custom emoji ID (wrapped in <tg-emoji>, so people with
+# Telegram Premium see your custom emoji and everyone else sees the
+# fallback unicode automatically — no setup required to work either way).
+# To get a custom emoji's ID: forward/send it in a chat with @userinfobot or
+# similar, or use the emoji in a message to a bot that echoes entities.
+# ============================================================================
+EMOJI_DEFAULTS = {
+    "verified": "✅",
+    "trophy": "🏆",
+    "clock": "⏰",
+    "skull": "💀",
+    "grave": "⚰️",
+    "warning": "⚠️",
+}
+
+def _emoji_html(key: str) -> str:
+    raw = os.getenv(f"EMOJI_{key.upper()}", "").strip()
+    fallback = EMOJI_DEFAULTS[key]
+    if not raw:
+        return fallback
+    if raw.isdigit():
+        return f'<tg-emoji emoji-id="{raw}">{fallback}</tg-emoji>'
+    return raw
+
+EMOJI = {k: _emoji_html(k) for k in EMOJI_DEFAULTS}
+
+# ============================================================================
+# STAT CARD IMAGE GENERATION — Instagram-style dark profile card
+# ============================================================================
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+def format_count(n) -> str:
+    if n is None:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K".replace(".0K", "K")
+    return str(n)
+
+def make_circular(img: Image.Image, size: int) -> Image.Image:
+    img = img.convert("RGBA").resize((size, size))
+    mask = Image.new("L", (size, size), 0)
+    d = ImageDraw.Draw(mask)
+    d.ellipse((0, 0, size, size), fill=255)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+async def fetch_profile_pic_bytes(profile_pic_url: Optional[str]) -> Optional[bytes]:
+    if not profile_pic_url:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(profile_pic_url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception as e:
+        logger.warning(f"Failed to fetch profile picture: {e}")
+    return None
+
+def _pill(d: ImageDraw.ImageDraw, x, y, w, h, color, text):
+    d.rounded_rectangle((x, y, x + w, y + h), radius=18, fill=color)
+    f = ImageFont.truetype(FONT_BOLD, 24)
+    tw = d.textlength(text, font=f)
+    d.text((x + w / 2 - tw / 2, y + 13), text, font=f, fill="white")
+
+def generate_stat_card(username, status, followers=None, following=None, posts=None,
+                        profile_pic_bytes=None, is_verified=False) -> str:
+    """
+    Two variants, styled after Instagram's dark-mode profile header:
+      - "active": real (or placeholder) avatar, live stats, blue verified
+        checkmark next to the username if is_verified.
+      - anything else ("suspended" / not found): muted gray avatar with a
+        red X overlay, username forced to "UserNotFound", stats forced to
+        0/0/0 — used for both a confirmed ban and an add/check on a
+        username that doesn't resolve, so both look consistent.
+    """
+    W, H = 1080, 420
+    img = Image.new("RGB", (W, H), (0, 0, 0))
+    d = ImageDraw.Draw(img)
+    fb = ImageFont.truetype(FONT_BOLD, 42)
+    fr = ImageFont.truetype(FONT_REGULAR, 24)
+    fs = ImageFont.truetype(FONT_BOLD, 32)
+
+    ax, ay, asz = 80, 70, 170
+    d.ellipse((ax - 4, ay - 4, ax + asz + 4, ay + asz + 4), outline=(60, 60, 60), width=3)
+
+    if status != "active":
+        d.ellipse((ax, ay, ax + asz, ay + asz), fill=(90, 90, 90))
+        pad = 34
+        d.line((ax + pad, ay + pad, ax + asz - pad, ay + asz - pad), fill=(214, 45, 45), width=10)
+        d.line((ax + asz - pad, ay + pad, ax + pad, ay + asz - pad), fill=(214, 45, 45), width=10)
+
+        tx = 300
+        d.text((tx, 90), "UserNotFound", font=fb, fill="white")
+        _pill(d, tx, 155, 150, 52, (0, 149, 246), "Follow")
+
+        stats_y = 250
+        d.text((tx, stats_y), "0 posts", font=fr, fill=(190, 190, 190))
+        d.text((tx + 160, stats_y), "0 followers", font=fr, fill=(190, 190, 190))
+        d.text((tx + 380, stats_y), "0 following", font=fr, fill=(190, 190, 190))
+        d.text((tx, stats_y + 55), "UserNotFound", font=fr, fill=(130, 130, 130))
+
+        p = CARDS_DIR / f"card_{username}_{status}.png"
+        img.save(p)
+        return str(p)
+
+    if profile_pic_bytes:
+        try:
+            av = make_circular(Image.open(io.BytesIO(profile_pic_bytes)), asz)
+            img.paste(av, (ax, ay), av)
+        except Exception:
+            d.ellipse((ax, ay, ax + asz, ay + asz), fill=(70, 70, 70))
+    else:
+        d.ellipse((ax, ay, ax + asz, ay + asz), fill=(70, 70, 70))
+
+    tx = 300
+    name_text = username + ("  ✔" if is_verified else "")
+    d.text((tx, 80), name_text, font=fb, fill="white" if not is_verified else (0, 149, 246))
+
+    _pill(d, tx, 140, 150, 52, (0, 149, 246), "Follow")
+    _pill(d, tx + 170, 140, 170, 52, (45, 45, 45), "Message")
+    d.rounded_rectangle((tx + 360, 140, 412 + tx, 192), radius=18, fill=(45, 45, 45))
+    d.text((tx + 386, 166), "\u22ef", font=fb, anchor="mm", fill="white")
+
+    start = 320
+    col = 180
+    vals = [str(posts or 0), format_count(followers), format_count(following)]
+    labs = ["Posts", "Followers", "Following"]
+    for i, (v, l) in enumerate(zip(vals, labs)):
+        cx = start + i * col
+        d.text((cx, 245), v, font=fs, anchor="mm", fill="white")
+        d.text((cx, 285), l, font=fr, anchor="mm", fill=(170, 170, 170))
+
+    p = CARDS_DIR / f"card_{username}_{status}.png"
+    img.save(p)
+    return str(p)
+
+# ============================================================================
+# INSTAGRAM STATUS CHECKER (direct API call, no browser needed)
+# ============================================================================
+class CheckResult:
+    def __init__(self, status: str, followers: Optional[int] = None,
+                 following: Optional[int] = None, posts: Optional[int] = None,
+                 is_verified: bool = False, profile_pic_url: Optional[str] = None, note: str = ""):
+        self.status = status  # "active" or "suspended" only
+        self.followers = followers
+        self.following = following
+        self.posts = posts
+        self.is_verified = is_verified
+        self.profile_pic_url = profile_pic_url
+        self.note = note
+
+async def check_instagram_status(username: str, retries: int = 2) -> CheckResult:
+    payload = {
+        "username": username,
+        "visitor_id": str(uuid.uuid4()),
+        "user_info": True,
+        "user_stories": False,
+        "user_highlights": False,
+        "user_posts": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://insta-story.com",
+        "Referer": "https://insta-story.com/instanavigation",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(API_URL, json=payload, headers=headers) as resp:
+                    status_code = resp.status
+
+                    if status_code == 429:
+                        logger.warning(f"@{username}: rate-limited (attempt {attempt+1})")
+                        if attempt < retries:
+                            await asyncio.sleep(3)
+                            continue
+                        return CheckResult("suspended", note="rate-limited after retries")
+
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        logger.warning(f"@{username}: non-JSON response (attempt {attempt+1})")
+                        if attempt < retries:
+                            await asyncio.sleep(2)
+                            continue
+                        return CheckResult("suspended", note="non-JSON response after retries")
+
+                    user_info = data.get("user_info")
+
+                    if isinstance(user_info, dict) and user_info.get("id"):
+                        followers = user_info.get("followers")
+                        following = user_info.get("following")
+                        posts = user_info.get("posts")
+                        is_verified = bool(user_info.get("is_verified", False))
+                        profile_pic_url = user_info.get("profile_pic_url")
+                        logger.info(f"@{username}: ACTIVE (id={user_info.get('id')})")
+                        return CheckResult("active", followers, following, posts, is_verified, profile_pic_url, note="")
+
+                    logger.info(f"@{username}: SUSPENDED (no valid user_info in response)")
+                    return CheckResult("suspended", note="")
+
+        except asyncio.TimeoutError:
+            logger.warning(f"@{username}: request timeout (attempt {attempt+1})")
+            if attempt < retries:
+                await asyncio.sleep(2)
+                continue
+            return CheckResult("suspended", note="timeout after retries")
+        except Exception as e:
+            logger.error(f"@{username}: request error (attempt {attempt+1}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(2)
+                continue
+            return CheckResult("suspended", note="")
+
+    return CheckResult("suspended", note="max retries exceeded")
+
+# ============================================================================
+# KEYBOARD HELPERS
+# ============================================================================
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Add"), KeyboardButton("📥 Bulk Add")],
+            [KeyboardButton("🔐 Verify Add"), KeyboardButton("🔍 Check")],
+            [KeyboardButton("📋 WatchList"), KeyboardButton("🧪 Preview")],
+            [KeyboardButton("🗑️ Clear All")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+def removal_keyboard(username_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes", callback_data=f"remove_yes:{username_key}"),
+            InlineKeyboardButton("❌ No", callback_data=f"remove_no:{username_key}"),
+        ]
+    ])
+
+def list_item_keyboard(username_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Remove this account", callback_data=f"remove_yes:{username_key}")]
+    ])
+
+def preview_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Ban Alert", callback_data="preview:ban"),
+         InlineKeyboardButton("🟢 Unban Alert", callback_data="preview:unban")],
+        [InlineKeyboardButton("✅ Verified", callback_data="preview:verify_on"),
+         InlineKeyboardButton("⚠️ Verify Expired", callback_data="preview:verify_off")],
+    ])
+
+# ============================================================================
+# IMAGE HELPERS
+# ============================================================================
+async def send_card_with_caption(chat_id: int, app: Application, image_path: str,
+                                   caption: str, reply_markup=None) -> None:
+    try:
+        with open(image_path, "rb") as img:
+            await app.bot.send_photo(
+                chat_id=chat_id, photo=img, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+            )
+    except Exception as e:
+        logger.error(f"Failed to send card image {image_path}: {e}")
+        await app.bot.send_message(
+            chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+
+# ============================================================================
+# RESPONSE TEXT BUILDERS
+# ============================================================================
+def build_active_text(username: str, followers, following, posts, is_verified, prefix: str = "") -> str:
+    link = format_username_link(username)
+    followers_str = f"{followers:,}" if followers is not None else "N/A"
+    following_str = f"{following:,}" if following is not None else "N/A"
+    posts_str = f"{posts:,}" if posts is not None else "N/A"
+    verified_str = f"\n{EMOJI['verified']} <b>Verified</b>" if is_verified else ""
+    return (
+        f"{prefix}"
+        f"<b>Account</b> : {link}\n"
+        f"<b>Posts</b> : {posts_str}\n"
+        f"<b>Followers</b> : {followers_str}\n"
+        f"<b>Following</b> : {following_str}{verified_str}\n\n"
+        f"🟢 <b>Current Status</b> : Active\n\n"
+        f"<i>{BOT_FOOTER_TEXT}</i>"
+    )
+
+def build_suspended_text(username: str, prefix: str = "") -> str:
+    link = format_username_link(username)
+    return (
+        f"{prefix}"
+        f"<b>Account</b> : {link}\n\n"
+        f"🔴 <b>Current Status</b> : Suspended\n\n"
+        f"<i>{BOT_FOOTER_TEXT}</i>"
+    )
+
+def build_added_text(username: str, status: str, followers=None, following=None, posts=None, is_verified=False) -> str:
+    if status == "active":
+        return "📋 <b>Added to WatchList</b>\n\n" + build_active_text(username, followers, following, posts, is_verified)
+    else:
+        return "📋 <b>Added to WatchList</b>\n\n" + build_suspended_text(username)
+
+def build_event_text(event: str, username: str, followers=None, time_taken_str=None, is_verified=False) -> str:
+    """event: 'ban' | 'unban' | 'verify_on' | 'verify_off'"""
+    link = format_username_link(username)
+    signature_part = f" | by {BOT_SIGNATURE}" if (event in ("ban", "unban") and BOT_SIGNATURE) else ""
+    titles = {
+        "ban": f"{EMOJI['skull']} <b>Account has been wiped</b>{signature_part}",
+        "unban": f"{EMOJI['grave']} <b>Account has returned from the grave</b>{signature_part}",
+        "verify_on": f"{EMOJI['verified']} <b>Account Verified</b>",
+        "verify_off": f"{EMOJI['warning']} <b>Verification Expired</b>",
+    }
+    lines = [titles[event], "", f"<b>Account</b> : {link}"]
+    if event in ("unban", "verify_on", "verify_off") and followers is not None:
+        lines.append(f"<b>Followers</b> : {followers:,}")
+
+    badge_bits = []
+    if event == "unban":
+        badge_bits.append(EMOJI["trophy"])
+    if is_verified and event != "verify_off":
+        badge_bits.append(EMOJI["verified"])
+    if badge_bits:
+        lines.append(" ".join(badge_bits))
+
+    if time_taken_str:
+        lines.append(f"{EMOJI['clock']} <b>Time Taken</b> : {time_taken_str}")
+
+    lines.append("")
+    lines.append(f"<i>{BOT_FOOTER_TEXT}</i>")
+    return "\n".join(lines)
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ You are not authorized.")
+        return
+    text = "📱 <b>Instagram Monitor Bot</b>\n\nUse the buttons below to get started:"
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_start(update, context)
+
+# ============================================================================
+# MESSAGE HANDLER
+# ============================================================================
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not is_authorized(user_id):
+        await update.effective_message.reply_text("⛔ Not authorized (or your access has expired).")
+        return
+
+    text = update.effective_message.text.strip()
+
+    if text == "➕ Add":
+        await update.effective_message.reply_text(
+            "Send me the Instagram username you want to monitor (e.g., nasa)\n\n"
+            "This will track ban/unban only. Use 🔐 Verify Add if you also want "
+            "verification-status alerts for this account.",
+            reply_markup=main_menu_keyboard(),
+        )
+        context.user_data["action"] = "add_username"
+
+    elif text == "📥 Bulk Add":
+        await update.effective_message.reply_text(
+            "Send me the usernames you want to monitor \u2014 one per line, or "
+            "comma-separated (e.g., nasa, spacex, vercel)",
+            reply_markup=main_menu_keyboard(),
+        )
+        context.user_data["action"] = "bulk_add_usernames"
+
+    elif text == "🔐 Verify Add":
+        await update.effective_message.reply_text(
+            "Send me the Instagram username to enable verification monitoring for.\n\n"
+            "If it's already on your WatchList, this just turns verification alerts "
+            "on for it. If not, it gets added fresh with both ban/unban AND "
+            "verification monitoring.",
+            reply_markup=main_menu_keyboard(),
+        )
+        context.user_data["action"] = "verify_add_username"
+
+    elif text == "📋 WatchList":
+        await show_user_list(update, user_id, context)
+
+    elif text == "🔍 Check":
+        await update.effective_message.reply_text(
+            "Send me the Instagram username to check (e.g., nasa)",
+            reply_markup=main_menu_keyboard(),
+        )
+        context.user_data["action"] = "check_status"
+
+    elif text == "🧪 Preview":
+        await update.effective_message.reply_text(
+            "Pick an alert to preview — sample formatting only, not a real detection:",
+            reply_markup=preview_menu_keyboard(),
+        )
+
+    elif text == "🗑️ Clear All":
+        all_data = await load_data()
+        user_key = get_user_key(user_id)
+        if user_key not in all_data or not all_data[user_key]:
+            await update.effective_message.reply_text(
+                "You have no accounts to clear.", reply_markup=main_menu_keyboard()
+            )
+        else:
+            await update.effective_message.reply_text(
+                "⚠️ This will remove ALL accounts from monitoring. Sure?",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes", callback_data="clear_confirm_yes"),
+                        InlineKeyboardButton("❌ No", callback_data="clear_confirm_no"),
+                    ]
+                ]),
+            )
+
+    else:
+        action = context.user_data.get("action")
+        if action == "add_username":
+            await perform_add(update, user_id, text, context)
+            del context.user_data["action"]
+        elif action == "bulk_add_usernames":
+            await perform_bulk_add(update, user_id, text, context)
+            del context.user_data["action"]
+        elif action == "verify_add_username":
+            await perform_verify_add(update, user_id, text, context)
+            del context.user_data["action"]
+        elif action == "check_status":
+            await perform_status_check(update, user_id, text, context)
+            del context.user_data["action"]
+        else:
+            await update.effective_message.reply_text(
+                "Tap a button to get started.", reply_markup=main_menu_keyboard()
+            )
+
+# ============================================================================
+# BUTTON CALLBACKS
+# ============================================================================
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_authorized(user_id):
+        await query.answer("⛔ Not authorized.", show_alert=True)
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data == "clear_confirm_yes":
+        all_data = await load_data()
+        user_key = get_user_key(user_id)
+        if user_key in all_data:
+            del all_data[user_key]
+            await save_data(all_data)
+        await query.edit_message_text("✅ Cleared all accounts. Your list is now empty.")
+
+    elif data == "clear_confirm_no":
+        await query.edit_message_text("👍 Kept all accounts.")
+
+    elif data.startswith("remove_yes:"):
+        username_key = data.split(":", 1)[1]
+        all_data = await load_data()
+        user_key = get_user_key(user_id)
+        if user_key in all_data and username_key in all_data[user_key]:
+            removed_username = all_data[user_key][username_key]["username"]
+            del all_data[user_key][username_key]
+            await save_data(all_data)
+            await query.edit_message_text(f"🗑️ Removed @{removed_username}.")
+            logger.info(f"User {user_id} removed @{removed_username}")
+
+    elif data.startswith("remove_no:"):
+        await query.edit_message_text("👍 Kept this account.")
+
+    elif data.startswith("preview:"):
+        event = data.split(":", 1)[1]
+        username = "example_user"
+        followers = 19614
+        is_verified = event == "verify_on"
+        show_followers = followers if event != "ban" else None
+        text = (
+            "🧪 <b>PREVIEW</b> — sample formatting only, not a real detection.\n\n"
+            + build_event_text(event, username, show_followers, "3h 2m", is_verified)
+        )
+        card_status = "active" if event != "ban" else "suspended"
+        card_path = generate_stat_card(username, card_status, followers, 289, 118, None, is_verified)
+        await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+
+# ============================================================================
+# ACTIONS
+# ============================================================================
+async def show_user_list(update: Update, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    all_data = await load_data()
+    user_key = get_user_key(user_id)
+
+    if user_key not in all_data or not all_data[user_key]:
+        await update.effective_message.reply_text(
+            "📭 You're not monitoring any accounts yet.", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    await update.effective_message.reply_text("📋 <b>WatchList</b>", parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+    for account_key, entry in sorted(all_data[user_key].items(), key=lambda kv: kv[1]["username"].lower()):
+        link = format_username_link(entry["username"])
+        status_line = "🔴 Suspended" if entry["status"] == "suspended" else "🟢 Active"
+        last_checked_text = relative_time(entry.get("last_checked", ""))
+        verify_line = ""
+        if entry.get("is_verified"):
+            verify_line += f"\n{EMOJI['verified']} Verified"
+        verify_line += f"\n🔐 Verification Monitoring: {'On' if entry.get('verify_watch') else 'Off'}"
+        text = (
+            f"👤 {link}\n"
+            f"{status_line}\n"
+            f"🕒 Last Checked: {last_checked_text}{verify_line}"
+        )
+        await context.application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=list_item_keyboard(account_key),
+        )
+
+async def perform_add(update: Update, user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = username.lstrip("@").strip()
+    key = username.lower()
+
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        await update.effective_message.reply_text(
+            "⚠️ Invalid Instagram username format.", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    all_data = await load_data()
+    user_key = get_user_key(user_id)
+    if user_key not in all_data:
+        all_data[user_key] = {}
+
+    if key in all_data[user_key]:
+        await update.effective_message.reply_text(
+            f"ℹ️ @{all_data[user_key][key]['username']} is already monitored.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    msg = await update.effective_message.reply_text(f"⌛ Checking @{username}")
+
+    result = await check_instagram_status(username)
+
+    now = datetime.now(timezone.utc).isoformat()
+    all_data[user_key][key] = {
+        "username": username,
+        "status": result.status,
+        "pending_status": None,
+        "pending_count": 0,
+        "case_index": 0,
+        "last_checked": now,
+        "added_at": now,
+        "is_verified": result.is_verified,
+        "verify_watch": False,
+    }
+    await save_data(all_data)
+
+    text = build_added_text(username, result.status, result.followers, result.following, result.posts, result.is_verified)
+    profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+    card_path = generate_stat_card(username, result.status, result.followers, result.following,
+                                    result.posts, profile_pic_bytes, result.is_verified)
+
+    await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+    await msg.delete()
+    logger.info(f"User {user_id} added @{username} (status: {result.status})")
+
+async def perform_verify_add(update: Update, user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Turns ON verification monitoring for an account — separate from
+    perform_add so a plain ban/unban add never silently starts tracking
+    verification. Works whether the account is already monitored (just
+    flips the flag) or brand new (adds it with the flag already on).
+    Always re-checks first to seed the current verified state as the
+    baseline, so turning this on never fires a false initial alert."""
+    username = username.lstrip("@").strip()
+    key = username.lower()
+
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        await update.effective_message.reply_text(
+            "⚠️ Invalid Instagram username format.", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    all_data = await load_data()
+    user_key = get_user_key(user_id)
+    if user_key not in all_data:
+        all_data[user_key] = {}
+
+    existing = all_data[user_key].get(key)
+    if existing and existing.get("verify_watch"):
+        await update.effective_message.reply_text(
+            f"ℹ️ Verification monitoring is already ON for @{existing['username']}.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    msg = await update.effective_message.reply_text(f"⌛ Checking @{username}")
+    case_index = existing.get("case_index", 0) if existing else 0
+    result = await check_instagram_status(generate_case_variant(username, case_index))
+
+    if existing:
+        existing["is_verified"] = result.is_verified
+        existing["verify_watch"] = True
+        all_data[user_key][key] = existing
+        title = f"🔐 <b>Verification monitoring enabled for @{username}</b>"
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        all_data[user_key][key] = {
+            "username": username, "status": result.status, "pending_status": None,
+            "pending_count": 0, "case_index": 0, "last_checked": now, "added_at": now,
+            "is_verified": result.is_verified, "verify_watch": True,
+        }
+        title = f"🔐 <b>Added @{username} with verification monitoring</b>"
+
+    await save_data(all_data)
+
+    state_str = f"verified {EMOJI['verified']}" if result.is_verified else "not verified"
+    text = f"{title}\n\nCurrently {state_str}.\n\n<i>{BOT_FOOTER_TEXT}</i>"
+    profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+    card_path = generate_stat_card(username, result.status, result.followers, result.following,
+                                    result.posts, profile_pic_bytes, result.is_verified)
+
+    await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+    await msg.delete()
+    logger.info(f"User {user_id} enabled verification monitoring for @{username}")
+
+async def perform_bulk_add(update: Update, user_id: int, raw_text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parse a block of pasted usernames (one per line, or comma/space separated),
+    add each one that isn't already monitored, and reply with a single summary
+    message (no per-account stat card images - that would flood the chat)."""
+    raw_tokens = re.split(r"[,\n]+", raw_text)
+    tokens = []
+    for chunk in raw_tokens:
+        tokens.extend(chunk.split())
+
+    seen = set()
+    usernames = []
+    for tok in tokens:
+        name = tok.lstrip("@").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        usernames.append(name)
+
+    if not usernames:
+        await update.effective_message.reply_text(
+            "⚠️ No usernames found in that input.", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    truncated = False
+    if len(usernames) > MAX_BULK_ADD:
+        truncated = True
+        usernames = usernames[:MAX_BULK_ADD]
+
+    msg = await update.effective_message.reply_text(f"⌛ Checking {len(usernames)} account(s)...")
+
+    all_data = await load_data()
+    user_key = get_user_key(user_id)
+    if user_key not in all_data:
+        all_data[user_key] = {}
+
+    added, skipped_existing, invalid, failed = [], [], [], []
+
+    for i, username in enumerate(usernames):
+        key = username.lower()
+
+        if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+            invalid.append(username)
+            continue
+
+        if key in all_data[user_key]:
+            skipped_existing.append(all_data[user_key][key]["username"])
+            continue
+
+        if i > 0:
+            delay = INTER_CHECK_DELAY_MS / 1000 + random.uniform(0, 1)
+            await asyncio.sleep(delay)
+
+        try:
+            result = await check_instagram_status(username)
+        except Exception as e:
+            logger.exception(f"Bulk add: error checking @{username}: {e}")
+            failed.append(username)
+            continue
+
+        now = datetime.now(timezone.utc).isoformat()
+        all_data[user_key][key] = {
+            "username": username,
+            "status": result.status,
+            "pending_status": None,
+            "pending_count": 0,
+            "case_index": 0,
+            "last_checked": now,
+            "added_at": now,
+            "is_verified": result.is_verified,
+            "verify_watch": False,
+        }
+        status_icon = "🟢" if result.status == "active" else "🔴"
+        vbadge = f" {EMOJI['verified']}" if result.is_verified else ""
+        added.append(f"{status_icon} {format_username_link(username)}{vbadge}")
+
+    if added:
+        await save_data(all_data)
+
+    lines = ["📥 <b>Bulk Add Results</b>"]
+    if added:
+        lines.append(f"\n✅ <b>Added ({len(added)})</b>\n" + "\n".join(added))
+    if skipped_existing:
+        lines.append(
+            f"\nℹ️ <b>Already Monitored ({len(skipped_existing)})</b>\n"
+            + "\n".join(format_username_link(u) for u in skipped_existing)
+        )
+    if invalid:
+        lines.append(
+            f"\n⚠️ <b>Invalid Format ({len(invalid)})</b>\n" + "\n".join(f"@{u}" for u in invalid)
+        )
+    if failed:
+        lines.append(
+            f"\n❌ <b>Failed to Check ({len(failed)})</b>\n"
+            + "\n".join(format_username_link(u) for u in failed)
+        )
+    if truncated:
+        lines.append(f"\n<i>Only the first {MAX_BULK_ADD} usernames were processed from your input.</i>")
+    lines.append(f"\n<i>{BOT_FOOTER_TEXT}</i>")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+    )
+    await msg.delete()
+    logger.info(f"User {user_id} bulk-added {len(added)} account(s)")
+
+async def perform_status_check(update: Update, user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = username.lstrip("@").strip()
+    msg = await update.effective_message.reply_text(f"⌛ Checking @{username}")
+
+    result = await check_instagram_status(username)
+
+    if result.status == "active":
+        text = build_active_text(username, result.followers, result.following, result.posts, result.is_verified)
+    else:
+        text = build_suspended_text(username)
+
+    profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+    card_path = generate_stat_card(username, result.status, result.followers, result.following,
+                                    result.posts, profile_pic_bytes, result.is_verified)
+
+    await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+    await msg.delete()
+
+# ============================================================================
+# KEEP-ALIVE SERVER (unchanged)
+# ============================================================================
+async def healthz(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+async def start_keepalive_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", healthz)
+    app.router.add_get("/healthz", healthz)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info(f"Keep-alive server listening on 0.0.0.0:{PORT} (/healthz)")
+
+# ============================================================================
+# POLLING LOOP (ban/unban both directions + opt-in verification monitoring)
+# ============================================================================
+async def notify_user(app: Application, user_id: int, text: str, card_path: Optional[str] = None,
+                       reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+    try:
+        if card_path:
+            await send_card_with_caption(user_id, app, card_path, text, reply_markup)
+        else:
+            await app.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except Forbidden:
+        logger.warning(f"Bot blocked by user {user_id}")
+    except (BadRequest, TelegramError) as e:
+        logger.error(f"Error notifying user {user_id}: {e}")
+
+async def poll_once(app: Application) -> None:
+    all_data = await load_data()
+    if not all_data:
+        return
+
+    for user_key, user_accounts in list(all_data.items()):
+        user_id = int(user_key.split("_")[1])
+
+        for account_key, entry in list(user_accounts.items()):
+            original_username = entry["username"]
+
+            current_case_index = entry.get("case_index", 0)
+            username = generate_case_variant(original_username, current_case_index)
+            entry["case_index"] = next_case_index(original_username, current_case_index)
+
+            delay = INTER_CHECK_DELAY_MS / 1000 + random.uniform(0, 1)
+            await asyncio.sleep(delay)
+
+            try:
+                result = await check_instagram_status(username)
+            except Exception as e:
+                logger.exception(f"Error checking @{original_username}: {e}")
+                continue
+
+            entry["last_checked"] = datetime.now(timezone.utc).isoformat()
+
+            if result.status != entry["status"]:
+                if entry.get("pending_status") == result.status:
+                    entry["pending_count"] = entry.get("pending_count", 0) + 1
+                else:
+                    entry["pending_status"] = result.status
+                    entry["pending_count"] = 1
+
+                if entry["pending_count"] >= CONFIRMATION_THRESHOLD:
+                    old_status = entry["status"]
+                    entry["status"] = result.status
+                    entry["pending_status"] = None
+                    entry["pending_count"] = 0
+
+                    time_taken_str = compute_time_taken(entry)
+
+                    if old_status == "active" and result.status == "suspended":
+                        text = build_event_text("ban", original_username, time_taken_str=time_taken_str)
+                        card_path = generate_stat_card(original_username, "suspended")
+
+                    elif old_status == "suspended" and result.status == "active":
+                        text = build_event_text("unban", original_username, result.followers, time_taken_str, result.is_verified)
+                        profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+                        card_path = generate_stat_card(original_username, "active", result.followers,
+                                                        result.following, result.posts, profile_pic_bytes, result.is_verified)
+
+                    else:
+                        text = f"Status changed: {old_status} → {result.status}\n\n{format_username_link(original_username)}"
+                        card_path = None
+
+                    keyboard = removal_keyboard(account_key)
+                    await notify_user(app, user_id, text, card_path, keyboard)
+                    logger.info(f"User {user_id}: @{original_username} {old_status} → {result.status}")
+            else:
+                entry["pending_status"] = None
+                entry["pending_count"] = 0
+
+            # Verification diffing — opt-in per account via verify_watch.
+            # is_verified is always tracked silently (for WatchList display)
+            # even when verify_watch is off; only the ALERT is gated.
+            if result.status == "active":
+                old_verified = bool(entry.get("is_verified", False))
+                new_verified = bool(result.is_verified)
+                verify_watch = bool(entry.get("verify_watch", False))
+                if new_verified != old_verified:
+                    entry["is_verified"] = new_verified
+                    if verify_watch:
+                        v_time_taken_str = compute_time_taken(entry)
+                        vevent = "verify_on" if new_verified else "verify_off"
+                        v_text = build_event_text(vevent, original_username, result.followers, v_time_taken_str, new_verified)
+                        v_profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+                        v_card_path = generate_stat_card(original_username, "active", result.followers,
+                                                          result.following, result.posts, v_profile_pic_bytes, new_verified)
+                        await notify_user(app, user_id, v_text, v_card_path, removal_keyboard(account_key))
+                        logger.info(f"User {user_id}: @{original_username} verification -> {new_verified}")
+                elif "is_verified" not in entry:
+                    entry["is_verified"] = new_verified
+
+            user_accounts[account_key] = entry
+
+        all_data[user_key] = user_accounts
+
+    await save_data(all_data)
+
+async def polling_loop(app: Application) -> None:
+    logger.info(f"Starting polling loop (interval={POLL_INTERVAL_SECONDS}s)")
+    await asyncio.sleep(2)
+    while True:
+        try:
+            await poll_once(app)
+        except Exception as e:
+            logger.exception(f"Polling error: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+# ============================================================================
+# LIFECYCLE
+# ============================================================================
+async def on_startup(app: Application) -> None:
+    logger.info("Starting up...")
+    await start_keepalive_server()
+    app.create_task(polling_loop(app), update=True)
+    logger.info("Bot startup complete.")
+
+async def on_shutdown(app: Application) -> None:
+    logger.info("Bot shutdown complete.")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main() -> None:
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    logger.info("Starting Telegram bot polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
