@@ -90,7 +90,7 @@ DATA_FILE = Path(os.getenv("DATA_FILE", "monitored_accounts.json"))
 CARDS_DIR = Path(os.getenv("CARDS_DIR", "cards"))
 CARDS_DIR.mkdir(parents=True, exist_ok=True)
 
-BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring").strip()
+BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Jensen Monitor").strip()
 BOT_SIGNATURE = os.getenv("BOT_SIGNATURE", "").strip()
 
 INTER_CHECK_DELAY_MS = 2000
