@@ -21,8 +21,9 @@ requested):
   - "Account has been wiped" / "Account has returned from the grave" premium
     phrasing, time-taken on every alert type, custom/premium Telegram emoji
     support, branded footer
-  - /preview — test-only rendering of any alert type, clearly marked, so you
-    can see the format without needing a real ban/unban/verification event
+  - 🎭 Fake Alert — test-only rendering of any alert type, pulling a real
+    account's current stats/avatar (same as the actual alert would show), so
+    you can see the format without needing a real ban/unban/verification event
 
 DETECTION METHOD / KNOWN LIMITATIONS: unchanged from before — see the
 original notes retained below.
@@ -90,8 +91,7 @@ DATA_FILE = Path(os.getenv("DATA_FILE", "monitored_accounts.json"))
 CARDS_DIR = Path(os.getenv("CARDS_DIR", "cards"))
 CARDS_DIR.mkdir(parents=True, exist_ok=True)
 
-BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Jensen Monitor").strip()
-BOT_SIGNATURE = os.getenv("BOT_SIGNATURE", "").strip()
+BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring").strip()
 
 INTER_CHECK_DELAY_MS = 2000
 MAX_BULK_ADD = 25  # safety cap so one paste can't queue an unbounded number of checks
@@ -369,8 +369,28 @@ EMOJI = {k: _emoji_html(k) for k in EMOJI_DEFAULTS}
 # ============================================================================
 # STAT CARD IMAGE GENERATION — Instagram-style dark profile card
 # ============================================================================
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+def _find_font(candidates: list, fallback: str) -> str:
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return fallback
+
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_DEJAVU_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+# Inter is installed via apt-get (see Dockerfile) — matches the Discord
+# Advanced bot's card look exactly. Falls back through Roboto, then
+# DejaVu, so this never crashes on a bare host.
+FONT_BOLD = _find_font([
+    "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
+    "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf",
+    "/usr/share/fonts/truetype/roboto-fontface/roboto/Roboto-Bold.ttf",
+], _DEJAVU_BOLD)
+FONT_REGULAR = _find_font([
+    "/usr/share/fonts/opentype/inter/Inter-Regular.otf",
+    "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
+    "/usr/share/fonts/truetype/roboto-fontface/roboto/Roboto-Regular.ttf",
+], _DEJAVU_REGULAR)
 
 def format_count(n) -> str:
     if n is None:
@@ -381,8 +401,19 @@ def format_count(n) -> str:
         return f"{n/1_000:.1f}K".replace(".0K", "K")
     return str(n)
 
+def _center_crop_square(img: Image.Image) -> Image.Image:
+    """Crop the longer side down so the image is square before it goes into
+    the circular mask — avoids squishing non-square avatars."""
+    w, h = img.size
+    if w == h:
+        return img
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    return img.crop((left, top, left + side, top + side))
+
 def make_circular(img: Image.Image, size: int) -> Image.Image:
-    img = img.convert("RGBA").resize((size, size))
+    img = _center_crop_square(img.convert("RGBA")).resize((size, size), Image.LANCZOS)
     mask = Image.new("L", (size, size), 0)
     d = ImageDraw.Draw(mask)
     d.ellipse((0, 0, size, size), fill=255)
@@ -390,96 +421,204 @@ def make_circular(img: Image.Image, size: int) -> Image.Image:
     out.paste(img, (0, 0), mask)
     return out
 
+# Shared browser-identity headers for every request to insta-story.com (the
+# API) AND the Instagram CDN image URLs it hands back — both are guarded by
+# the same anti-bot checks, so both need to look like the same "browser
+# session" hitting insta-story.com.
+IG_REQUEST_HEADERS = {
+    "Origin": "https://insta-story.com",
+    "Referer": "https://insta-story.com/instanavigation",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
 async def fetch_profile_pic_bytes(profile_pic_url: Optional[str]) -> Optional[bytes]:
     if not profile_pic_url:
         return None
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        **IG_REQUEST_HEADERS,
+    }
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(profile_pic_url) as resp:
+            async with session.get(profile_pic_url, headers=headers) as resp:
                 if resp.status == 200:
                     return await resp.read()
+                logger.warning(f"Profile picture fetch got HTTP {resp.status}")
     except Exception as e:
         logger.warning(f"Failed to fetch profile picture: {e}")
     return None
 
-def _pill(d: ImageDraw.ImageDraw, x, y, w, h, color, text):
-    d.rounded_rectangle((x, y, x + w, y + h), radius=18, fill=color)
-    f = ImageFont.truetype(FONT_BOLD, 24)
-    tw = d.textlength(text, font=f)
-    d.text((x + w / 2 - tw / 2, y + 13), text, font=f, fill="white")
+# Sampled directly from the Discord Advanced bot's card — a soft charcoal,
+# not pure black.
+CARD_BG = (18, 18, 20)
+
+def _pill_centered(d: ImageDraw.ImageDraw, x, y_center, w, h, color, text, font_size=26):
+    """Vertically-centered pill, used in the single-row header below."""
+    top = y_center - h / 2
+    d.rounded_rectangle((x, top, x + w, top + h), radius=h / 2, fill=color)
+    f = ImageFont.truetype(FONT_BOLD, font_size)
+    d.text((x + w / 2, y_center), text, font=f, fill="white", anchor="mm")
+
+def _draw_verified_badge(d: ImageDraw.ImageDraw, cx, cy, r=16, color=(0, 149, 246), outline=None):
+    outline = outline or CARD_BG
+    d.ellipse((cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3), fill=outline)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
+    d.line(
+        [(cx - r * 0.5, cy + r * 0.05), (cx - r * 0.05, cy + r * 0.45), (cx + r * 0.55, cy - r * 0.35)],
+        fill="white", width=3, joint="curve",
+    )
+
+def _draw_dots(d: ImageDraw.ImageDraw, x, y, color=(140, 140, 140), r=4, gap=15):
+    for i in range(3):
+        cx = x + i * gap
+        d.ellipse((cx - r, y - r, cx + r, y + r), fill=color)
+    return x + 2 * gap + r
+
+def _draw_stat(d: ImageDraw.ImageDraw, x, y, number, label, font_num, font_label, gap_after=44):
+    d.text((x, y), number, font=font_num, fill="white", anchor="lm")
+    num_w = d.textlength(number, font=font_num)
+    label_x = x + num_w + 8
+    d.text((label_x, y), label, font=font_label, fill=(163, 163, 163), anchor="lm")
+    label_w = d.textlength(label, font=font_label)
+    return label_x + label_w + gap_after
+
+STATUS_PILL_COLORS = {
+    "RECOVERED": (56, 193, 114),
+    "BANNED": (224, 54, 54),
+    "VERIFIED": (0, 149, 246),
+    "EXPIRED": (230, 160, 30),
+}
+RING_COLOR_DEFAULT = (70, 70, 70)
+RING_COLOR_GREEN = (56, 193, 114)
+RING_COLOR_RED = (224, 54, 54)
+RING_COLOR_BLUE = (0, 149, 246)
+RING_COLOR_YELLOW = (230, 160, 30)
+CARD_CORNER_RADIUS = 40
+
+def _round_corners(img: Image.Image, radius: int) -> Image.Image:
+    img = img.convert("RGBA")
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, img.width, img.height), radius=radius, fill=255)
+    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+# Layout constants — identical to the Discord Advanced bot's card, so both
+# platforms render the same alert the same way.
+W, H = 1170, 453
+AX, AY, ASZ = 60, 95, 280
+RING_PAD, RING_WIDTH = 6, 7
+TX = 379
+ROW1_Y = 148
+ROW2_Y = 246
+ROW3_Y = 309
 
 def generate_stat_card(username, status, followers=None, following=None, posts=None,
-                        profile_pic_bytes=None, is_verified=False) -> str:
+                        profile_pic_bytes=None, is_verified=False,
+                        status_label=None, ring_color=None, bio=None) -> str:
     """
-    Two variants, styled after Instagram's dark-mode profile header:
-      - "active": real (or placeholder) avatar, live stats, blue verified
-        checkmark next to the username if is_verified.
+    Two variants, styled after Instagram's dark-mode profile header — same
+    layout as the Discord Advanced bot's card:
+      - "active": avatar, live stats, one header row (username + optional
+        verified badge + colored status pill + "..." menu), a stats row,
+        and an optional bio line — used for RECOVERED (green), VERIFIED
+        (blue), EXPIRED (yellow) cards.
       - anything else ("suspended" / not found): muted gray avatar with a
         red X overlay, username forced to "UserNotFound", stats forced to
-        0/0/0 — used for both a confirmed ban and an add/check on a
-        username that doesn't resolve, so both look consistent.
-    """
-    W, H = 1080, 420
-    img = Image.new("RGB", (W, H), (0, 0, 0))
-    d = ImageDraw.Draw(img)
-    fb = ImageFont.truetype(FONT_BOLD, 42)
-    fr = ImageFont.truetype(FONT_REGULAR, 24)
-    fs = ImageFont.truetype(FONT_BOLD, 32)
+        0/0/0.
 
-    ax, ay, asz = 80, 70, 170
-    d.ellipse((ax - 4, ay - 4, ax + asz + 4, ay + asz + 4), outline=(60, 60, 60), width=3)
+    status_label: "RECOVERED" / "BANNED" / "VERIFIED" / "EXPIRED" — picks
+    the pill color/text from STATUS_PILL_COLORS. Falls back to a plain
+    blue "Follow" pill if omitted.
+
+    ring_color: overrides the avatar ring color. Pass one of the
+    RING_COLOR_* constants to match status_label.
+    """
+    img = Image.new("RGB", (W, H), CARD_BG)
+    d = ImageDraw.Draw(img)
+    fb = ImageFont.truetype(FONT_BOLD, 46)
+    fr = ImageFont.truetype(FONT_REGULAR, 26)
+    fs = ImageFont.truetype(FONT_BOLD, 34)
+
+    ring = ring_color or RING_COLOR_DEFAULT
+    d.ellipse(
+        (AX - RING_PAD, AY - RING_PAD, AX + ASZ + RING_PAD, AY + ASZ + RING_PAD),
+        outline=ring, width=RING_WIDTH,
+    )
+
+    pill_color = (0, 149, 246)
+    pill_text = "Follow"
+    if status_label and status_label in STATUS_PILL_COLORS:
+        pill_color = STATUS_PILL_COLORS[status_label]
+        pill_text = status_label
 
     if status != "active":
-        d.ellipse((ax, ay, ax + asz, ay + asz), fill=(90, 90, 90))
-        pad = 34
-        d.line((ax + pad, ay + pad, ax + asz - pad, ay + asz - pad), fill=(214, 45, 45), width=10)
-        d.line((ax + asz - pad, ay + pad, ax + pad, ay + asz - pad), fill=(214, 45, 45), width=10)
+        d.ellipse((AX, AY, AX + ASZ, AY + ASZ), fill=(80, 80, 80))
+        pad = ASZ * 0.2
+        d.line((AX + pad, AY + pad, AX + ASZ - pad, AY + ASZ - pad), fill=(214, 45, 45), width=14)
+        d.line((AX + ASZ - pad, AY + pad, AX + pad, AY + ASZ - pad), fill=(214, 45, 45), width=14)
 
-        tx = 300
-        d.text((tx, 90), "UserNotFound", font=fb, fill="white")
-        _pill(d, tx, 155, 150, 52, (0, 149, 246), "Follow")
+        d.text((TX, ROW1_Y), "UserNotFound", font=fb, fill="white", anchor="lm")
+        pill_w = max(160, len(pill_text) * 17 + 50)
+        _pill_centered(d, TX, ROW1_Y + 62, pill_w, 54, pill_color, pill_text)
 
-        stats_y = 250
-        d.text((tx, stats_y), "0 posts", font=fr, fill=(190, 190, 190))
-        d.text((tx + 160, stats_y), "0 followers", font=fr, fill=(190, 190, 190))
-        d.text((tx + 380, stats_y), "0 following", font=fr, fill=(190, 190, 190))
-        d.text((tx, stats_y + 55), "UserNotFound", font=fr, fill=(130, 130, 130))
+        d.text((TX, ROW2_Y), "0 posts", font=fr, fill=(163, 163, 163))
+        d.text((TX + 190, ROW2_Y), "0 followers", font=fr, fill=(163, 163, 163))
+        d.text((TX + 440, ROW2_Y), "0 following", font=fr, fill=(163, 163, 163))
+        d.text((TX, ROW3_Y), "UserNotFound", font=fr, fill=(130, 130, 130))
 
         p = CARDS_DIR / f"card_{username}_{status}.png"
-        img.save(p)
+        _round_corners(img, CARD_CORNER_RADIUS).save(p)
         return str(p)
 
     if profile_pic_bytes:
         try:
-            av = make_circular(Image.open(io.BytesIO(profile_pic_bytes)), asz)
-            img.paste(av, (ax, ay), av)
+            av = make_circular(Image.open(io.BytesIO(profile_pic_bytes)), ASZ)
+            img.paste(av, (AX, AY), av)
         except Exception:
-            d.ellipse((ax, ay, ax + asz, ay + asz), fill=(70, 70, 70))
+            d.ellipse((AX, AY, AX + ASZ, AY + ASZ), fill=(60, 60, 60))
     else:
-        d.ellipse((ax, ay, ax + asz, ay + asz), fill=(70, 70, 70))
+        d.ellipse((AX, AY, AX + ASZ, AY + ASZ), fill=(60, 60, 60))
 
-    tx = 300
-    name_text = username + ("  ✔" if is_verified else "")
-    d.text((tx, 80), name_text, font=fb, fill="white" if not is_verified else (0, 149, 246))
+    d.text((TX, ROW1_Y), username, font=fb, fill="white", anchor="lm")
+    x = TX + d.textlength(username, font=fb) + 20
 
-    _pill(d, tx, 140, 150, 52, (0, 149, 246), "Follow")
-    _pill(d, tx + 170, 140, 170, 52, (45, 45, 45), "Message")
-    d.rounded_rectangle((tx + 360, 140, 412 + tx, 192), radius=18, fill=(45, 45, 45))
-    d.text((tx + 386, 166), "\u22ef", font=fb, anchor="mm", fill="white")
+    if is_verified:
+        _draw_verified_badge(d, x + 16, ROW1_Y - 2, r=16)
+        x += 32 + 24
 
-    start = 320
-    col = 180
-    vals = [str(posts or 0), format_count(followers), format_count(following)]
-    labs = ["Posts", "Followers", "Following"]
-    for i, (v, l) in enumerate(zip(vals, labs)):
-        cx = start + i * col
-        d.text((cx, 245), v, font=fs, anchor="mm", fill="white")
-        d.text((cx, 285), l, font=fr, anchor="mm", fill=(170, 170, 170))
+    pill_w = max(150, len(pill_text) * 17 + 50)
+    _pill_centered(d, x, ROW1_Y, pill_w, 54, pill_color, pill_text)
+    x += pill_w + 30
 
-    p = CARDS_DIR / f"card_{username}_{status}.png"
-    img.save(p)
+    _draw_dots(d, x, ROW1_Y)
+
+    x = TX
+    x = _draw_stat(d, x, ROW2_Y, str(posts or 0), "posts", fs, fr)
+    x = _draw_stat(d, x, ROW2_Y, format_count(followers), "followers", fs, fr)
+    _draw_stat(d, x, ROW2_Y, format_count(following), "following", fs, fr)
+
+    if bio:
+        d.text((TX, ROW3_Y), bio, font=fr, fill=(163, 163, 163), anchor="lm")
+
+    tag = (status_label or status).lower()
+    p = CARDS_DIR / f"card_{username}_{tag}.png"
+    _round_corners(img, CARD_CORNER_RADIUS).save(p)
     return str(p)
+
+# Maps each alert event to its card's (status_label, ring_color) — shared
+# by the real poll-cycle alerts and /fake, so both render identically, and
+# matches the Discord Advanced bot's EVENT_CARD_STYLE exactly.
+EVENT_CARD_STYLE = {
+    "ban": ("BANNED", RING_COLOR_RED),
+    "unban": ("RECOVERED", RING_COLOR_GREEN),
+    "verify_on": ("VERIFIED", RING_COLOR_BLUE),
+    "verify_off": ("EXPIRED", RING_COLOR_YELLOW),
+}
 
 # ============================================================================
 # INSTAGRAM STATUS CHECKER (direct API call, no browser needed)
@@ -507,12 +646,7 @@ async def check_instagram_status(username: str, retries: int = 2) -> CheckResult
     }
     headers = {
         "Content-Type": "application/json",
-        "Origin": "https://insta-story.com",
-        "Referer": "https://insta-story.com/instanavigation",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        **IG_REQUEST_HEADERS,
     }
 
     for attempt in range(retries + 1):
@@ -575,7 +709,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("➕ Add"), KeyboardButton("📥 Bulk Add")],
             [KeyboardButton("🔐 Verify Add"), KeyboardButton("🔍 Check")],
-            [KeyboardButton("📋 WatchList"), KeyboardButton("🧪 Preview")],
+            [KeyboardButton("📋 WatchList"), KeyboardButton("🎭 Fake Alert")],
             [KeyboardButton("🗑️ Clear All")],
         ],
         resize_keyboard=True,
@@ -595,12 +729,12 @@ def list_item_keyboard(username_key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗑️ Remove this account", callback_data=f"remove_yes:{username_key}")]
     ])
 
-def preview_menu_keyboard() -> InlineKeyboardMarkup:
+def fake_alert_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Ban Alert", callback_data="preview:ban"),
-         InlineKeyboardButton("🟢 Unban Alert", callback_data="preview:unban")],
-        [InlineKeyboardButton("✅ Verified", callback_data="preview:verify_on"),
-         InlineKeyboardButton("⚠️ Verify Expired", callback_data="preview:verify_off")],
+        [InlineKeyboardButton("🔴 Ban Alert", callback_data="fake:ban"),
+         InlineKeyboardButton("🟢 Unban Alert", callback_data="fake:unban")],
+        [InlineKeyboardButton("✅ Verified", callback_data="fake:verify_on"),
+         InlineKeyboardButton("⚠️ Verify Expired", callback_data="fake:verify_off")],
     ])
 
 # ============================================================================
@@ -623,61 +757,64 @@ async def send_card_with_caption(chat_id: int, app: Application, image_path: str
 # ============================================================================
 # RESPONSE TEXT BUILDERS
 # ============================================================================
-def build_active_text(username: str, followers, following, posts, is_verified, prefix: str = "") -> str:
+def build_check_text(username: str, result: "CheckResult") -> str:
+    """Matches the Discord Advanced bot's build_check_embed exactly:
+    plain "@username" + a single "Followers: N | [verified badge]" line,
+    or a "not found" line for a suspended/unresolvable account."""
     link = format_username_link(username)
-    followers_str = f"{followers:,}" if followers is not None else "N/A"
-    following_str = f"{following:,}" if following is not None else "N/A"
-    posts_str = f"{posts:,}" if posts is not None else "N/A"
-    verified_str = f"\n{EMOJI['verified']} <b>Verified</b>" if is_verified else ""
-    return (
-        f"{prefix}"
-        f"<b>Account</b> : {link}\n"
-        f"<b>Posts</b> : {posts_str}\n"
-        f"<b>Followers</b> : {followers_str}\n"
-        f"<b>Following</b> : {following_str}{verified_str}\n\n"
-        f"🟢 <b>Current Status</b> : Active\n\n"
-        f"<i>{BOT_FOOTER_TEXT}</i>"
-    )
-
-def build_suspended_text(username: str, prefix: str = "") -> str:
-    link = format_username_link(username)
-    return (
-        f"{prefix}"
-        f"<b>Account</b> : {link}\n\n"
-        f"🔴 <b>Current Status</b> : Suspended\n\n"
-        f"<i>{BOT_FOOTER_TEXT}</i>"
-    )
-
-def build_added_text(username: str, status: str, followers=None, following=None, posts=None, is_verified=False) -> str:
-    if status == "active":
-        return "📋 <b>Added to WatchList</b>\n\n" + build_active_text(username, followers, following, posts, is_verified)
+    if result.status == "active":
+        desc = [f"Followers: {result.followers:,}" if result.followers is not None else "Followers: N/A"]
+        if result.is_verified:
+            desc.append(EMOJI["verified"])
+        lines = [f"<b>{link}</b>", " | ".join(desc)]
     else:
-        return "📋 <b>Added to WatchList</b>\n\n" + build_suspended_text(username)
+        lines = [f"{EMOJI['warning']} @{username} not found"]
+    lines.append("")
+    lines.append(f"<i>{BOT_FOOTER_TEXT}</i>")
+    return "\n".join(lines)
+
+def build_added_text(username: str, result: "CheckResult") -> str:
+    """Matches the Discord Advanced bot's build_added_embed exactly."""
+    link = format_username_link(username)
+    if result.status == "active":
+        desc = [f"Followers: {result.followers:,}" if result.followers is not None else "Followers: N/A"]
+        if result.is_verified:
+            desc.append(EMOJI["verified"])
+        lines = [f"📋 <b>Added</b> {link} <b>to WatchList</b>", " | ".join(desc)]
+    else:
+        lines = [f"{EMOJI['warning']} @{username} not found"]
+    lines.append("")
+    lines.append(f"<i>{BOT_FOOTER_TEXT}</i>")
+    return "\n".join(lines)
 
 def build_event_text(event: str, username: str, followers=None, time_taken_str=None, is_verified=False) -> str:
-    """event: 'ban' | 'unban' | 'verify_on' | 'verify_off'"""
-    link = format_username_link(username)
-    signature_part = f" | by {BOT_SIGNATURE}" if (event in ("ban", "unban") and BOT_SIGNATURE) else ""
-    titles = {
-        "ban": f"{EMOJI['skull']} <b>Account has been wiped</b>{signature_part}",
-        "unban": f"{EMOJI['grave']} <b>Account has returned from the grave</b>{signature_part}",
-        "verify_on": f"{EMOJI['verified']} <b>Account Verified</b>",
-        "verify_off": f"{EMOJI['warning']} <b>Verification Expired</b>",
+    """event: 'ban' | 'unban' | 'verify_on' | 'verify_off' — matches the
+    Discord Advanced bot's build_event_embed wording/format exactly:
+    "<emoji> Account <Status> | <code>@username</code>" title, with bold
+    values in the body."""
+    status_words = {
+        "ban": "Account Banned",
+        "unban": "Account Recovered",
+        "verify_on": "Account Verified",
+        "verify_off": "Verification Expired",
     }
-    lines = [titles[event], "", f"<b>Account</b> : {link}"]
+    status_emojis = {
+        "ban": "❌",
+        "unban": "✅",
+        "verify_on": "✅",
+        "verify_off": EMOJI["warning"],
+    }
+    title = f"{status_emojis[event]} <b>{status_words[event]}</b> | <code>@{username}</code>"
+    lines = [title]
+
+    desc_parts = []
     if event in ("unban", "verify_on", "verify_off") and followers is not None:
-        lines.append(f"<b>Followers</b> : {followers:,}")
-
-    badge_bits = []
-    if event == "unban":
-        badge_bits.append(EMOJI["trophy"])
-    if is_verified and event != "verify_off":
-        badge_bits.append(EMOJI["verified"])
-    if badge_bits:
-        lines.append(" ".join(badge_bits))
-
+        desc_parts.append(f"👥 Followers: <b>{followers:,}</b>")
     if time_taken_str:
-        lines.append(f"{EMOJI['clock']} <b>Time Taken</b> : {time_taken_str}")
+        desc_parts.append(f"{EMOJI['clock']} Time: <b>{time_taken_str}</b>")
+    if desc_parts:
+        lines.append("")
+        lines.append(" | ".join(desc_parts))
 
     lines.append("")
     lines.append(f"<i>{BOT_FOOTER_TEXT}</i>")
@@ -745,10 +882,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         context.user_data["action"] = "check_status"
 
-    elif text == "🧪 Preview":
+    elif text == "🎭 Fake Alert":
         await update.effective_message.reply_text(
-            "Pick an alert to preview — sample formatting only, not a real detection:",
-            reply_markup=preview_menu_keyboard(),
+            "Which alert do you want to preview?",
+            reply_markup=fake_alert_menu_keyboard(),
         )
 
     elif text == "🗑️ Clear All":
@@ -782,6 +919,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             del context.user_data["action"]
         elif action == "check_status":
             await perform_status_check(update, user_id, text, context)
+            del context.user_data["action"]
+        elif action == "fake_alert_username":
+            fake_event = context.user_data.pop("fake_event", "ban")
+            await perform_fake_alert(update, user_id, text, fake_event, context)
             del context.user_data["action"]
         else:
             await update.effective_message.reply_text(
@@ -827,19 +968,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("remove_no:"):
         await query.edit_message_text("👍 Kept this account.")
 
-    elif data.startswith("preview:"):
+    elif data.startswith("fake:"):
         event = data.split(":", 1)[1]
-        username = "example_user"
-        followers = 19614
-        is_verified = event == "verify_on"
-        show_followers = followers if event != "ban" else None
-        text = (
-            "🧪 <b>PREVIEW</b> — sample formatting only, not a real detection.\n\n"
-            + build_event_text(event, username, show_followers, "3h 2m", is_verified)
-        )
-        card_status = "active" if event != "ban" else "suspended"
-        card_path = generate_stat_card(username, card_status, followers, 289, 118, None, is_verified)
-        await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+        context.user_data["fake_event"] = event
+        context.user_data["action"] = "fake_alert_username"
+        if event == "ban":
+            prompt = "Send me the Instagram username to preview a ban alert for."
+        else:
+            prompt = "Send me a real Instagram username — I'll pull its current stats/avatar for the preview."
+        await query.message.reply_text(prompt, reply_markup=main_menu_keyboard())
 
 # ============================================================================
 # ACTIONS
@@ -916,10 +1053,10 @@ async def perform_add(update: Update, user_id: int, username: str, context: Cont
     }
     await save_data(all_data)
 
-    text = build_added_text(username, result.status, result.followers, result.following, result.posts, result.is_verified)
+    text = build_added_text(username, result)
     profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
-    card_path = generate_stat_card(username, result.status, result.followers, result.following,
-                                    result.posts, profile_pic_bytes, result.is_verified)
+    card_path = await asyncio.to_thread(generate_stat_card, username, result.status, result.followers,
+                                         result.following, result.posts, profile_pic_bytes, result.is_verified)
 
     await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
     await msg.delete()
@@ -977,8 +1114,8 @@ async def perform_verify_add(update: Update, user_id: int, username: str, contex
     state_str = f"verified {EMOJI['verified']}" if result.is_verified else "not verified"
     text = f"{title}\n\nCurrently {state_str}.\n\n<i>{BOT_FOOTER_TEXT}</i>"
     profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
-    card_path = generate_stat_card(username, result.status, result.followers, result.following,
-                                    result.posts, profile_pic_bytes, result.is_verified)
+    card_path = await asyncio.to_thread(generate_stat_card, username, result.status, result.followers,
+                                         result.following, result.posts, profile_pic_bytes, result.is_verified)
 
     await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
     await msg.delete()
@@ -1099,14 +1236,48 @@ async def perform_status_check(update: Update, user_id: int, username: str, cont
 
     result = await check_instagram_status(username)
 
-    if result.status == "active":
-        text = build_active_text(username, result.followers, result.following, result.posts, result.is_verified)
-    else:
-        text = build_suspended_text(username)
+    text = build_check_text(username, result)
 
     profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
-    card_path = generate_stat_card(username, result.status, result.followers, result.following,
-                                    result.posts, profile_pic_bytes, result.is_verified)
+    card_path = await asyncio.to_thread(generate_stat_card, username, result.status, result.followers,
+                                         result.following, result.posts, profile_pic_bytes, result.is_verified)
+
+    await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
+    await msg.delete()
+
+async def perform_fake_alert(update: Update, user_id: int, username: str, event: str,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+    """event: 'ban' | 'unban' | 'verify_on' | 'verify_off'. Mirrors the
+    Discord Advanced bot's /fake exactly: pulls the real account's current
+    stats/avatar for unban/verify_on/verify_off (nothing real to pull for
+    a ban, so that one stays a synthetic "not found" card), and renders
+    with the same build_event_text/generate_stat_card used for a real
+    alert — no watermark, no "this is a preview" text, identical output."""
+    username = username.lstrip("@").strip()
+    msg = await update.effective_message.reply_text(f"⌛ Building preview for @{username}")
+    status_label, ring_color = EVENT_CARD_STYLE[event]
+
+    if event == "ban":
+        text = build_event_text("ban", username, time_taken_str="3h 2m")
+        card_path = await asyncio.to_thread(generate_stat_card, username, "suspended",
+                                             status_label=status_label, ring_color=ring_color)
+    else:
+        result = await check_instagram_status(username)
+        profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
+        real_followers = result.followers if result.followers is not None else 19614
+        # The verify badge reflects the event being previewed (that's the
+        # whole point of "gained"/"expired"), not the account's live status.
+        if event == "verify_on":
+            is_verified = True
+        elif event == "verify_off":
+            is_verified = False
+        else:
+            is_verified = result.is_verified
+
+        text = build_event_text(event, username, real_followers, "3h 2m", is_verified)
+        card_path = await asyncio.to_thread(generate_stat_card, username, "active", real_followers,
+                                             result.following, result.posts, profile_pic_bytes, is_verified,
+                                             status_label=status_label, ring_color=ring_color)
 
     await send_card_with_caption(user_id, context.application, card_path, text, main_menu_keyboard())
     await msg.delete()
@@ -1185,13 +1356,17 @@ async def poll_once(app: Application) -> None:
 
                     if old_status == "active" and result.status == "suspended":
                         text = build_event_text("ban", original_username, time_taken_str=time_taken_str)
-                        card_path = generate_stat_card(original_username, "suspended")
+                        status_label, ring_color = EVENT_CARD_STYLE["ban"]
+                        card_path = await asyncio.to_thread(generate_stat_card, original_username, "suspended",
+                                                             status_label=status_label, ring_color=ring_color)
 
                     elif old_status == "suspended" and result.status == "active":
                         text = build_event_text("unban", original_username, result.followers, time_taken_str, result.is_verified)
                         profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
-                        card_path = generate_stat_card(original_username, "active", result.followers,
-                                                        result.following, result.posts, profile_pic_bytes, result.is_verified)
+                        status_label, ring_color = EVENT_CARD_STYLE["unban"]
+                        card_path = await asyncio.to_thread(generate_stat_card, original_username, "active", result.followers,
+                                                             result.following, result.posts, profile_pic_bytes, result.is_verified,
+                                                             status_label=status_label, ring_color=ring_color)
 
                     else:
                         text = f"Status changed: {old_status} → {result.status}\n\n{format_username_link(original_username)}"
@@ -1218,8 +1393,10 @@ async def poll_once(app: Application) -> None:
                         vevent = "verify_on" if new_verified else "verify_off"
                         v_text = build_event_text(vevent, original_username, result.followers, v_time_taken_str, new_verified)
                         v_profile_pic_bytes = await fetch_profile_pic_bytes(result.profile_pic_url)
-                        v_card_path = generate_stat_card(original_username, "active", result.followers,
-                                                          result.following, result.posts, v_profile_pic_bytes, new_verified)
+                        v_status_label, v_ring_color = EVENT_CARD_STYLE[vevent]
+                        v_card_path = await asyncio.to_thread(generate_stat_card, original_username, "active", result.followers,
+                                                               result.following, result.posts, v_profile_pic_bytes, new_verified,
+                                                               status_label=v_status_label, ring_color=v_ring_color)
                         await notify_user(app, user_id, v_text, v_card_path, removal_keyboard(account_key))
                         logger.info(f"User {user_id}: @{original_username} verification -> {new_verified}")
                 elif "is_verified" not in entry:
