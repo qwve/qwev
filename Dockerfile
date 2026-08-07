@@ -21,9 +21,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install DejaVu fonts (needed for Pillow-based stat card image generation)
+# Inter is the primary font for the stat-card image generation (gives the
+# cards their premium look, matches the Discord bot exactly). fonts-dejavu-core
+# stays installed as the fallback the code drops to if Inter is ever missing.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends fonts-dejavu-core && \
+    apt-get install -y --no-install-recommends fonts-inter fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
