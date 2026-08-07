@@ -733,7 +733,7 @@ def fake_alert_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔴 Ban Alert", callback_data="fake:ban"),
          InlineKeyboardButton("🟢 Unban Alert", callback_data="fake:unban")],
-        [InlineKeyboardButton("✅ Verified", callback_data="fake:verify_on"),
+        [InlineKeyboardButton("🔵 Verified", callback_data="fake:verify_on"),
          InlineKeyboardButton("⚠️ Verify Expired", callback_data="fake:verify_off")],
     ])
 
@@ -801,7 +801,7 @@ def build_event_text(event: str, username: str, followers=None, time_taken_str=N
     status_emojis = {
         "ban": "❌",
         "unban": "✅",
-        "verify_on": "✅",
+        "verify_on": "🔵",
         "verify_off": EMOJI["warning"],
     }
     title = f"{status_emojis[event]} <b>{status_words[event]}</b> | <code>@{username}</code>"
