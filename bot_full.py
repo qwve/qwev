@@ -347,7 +347,7 @@ def next_case_index(original_username: str, current_index: int) -> int:
 # similar, or use the emoji in a message to a bot that echoes entities.
 # ============================================================================
 EMOJI_DEFAULTS = {
-    "verified": "✅",
+    "verified": "🔵",
     "trophy": "🏆",
     "clock": "⏰",
     "skull": "💀",
