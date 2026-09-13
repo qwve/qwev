@@ -503,10 +503,12 @@ async def refresh_proxy_pool() -> None:
         _live_proxy_pool = list(PROXIES_STATIC)
         return
 
+    start = asyncio.get_event_loop().time()
     candidates = await _fetch_proxy_candidates()
     if not candidates:
         logger.warning("No proxy candidates found; keeping previous pool.")
         return
+    logger.info(f"Proxy pool: fetched {len(candidates)} candidates, health-checking...")
 
     sem = asyncio.Semaphore(PROXY_HEALTHCHECK_CONCURRENCY)
     try:
@@ -519,12 +521,14 @@ async def refresh_proxy_pool() -> None:
         logger.warning(f"Proxy health-check pass failed: {e}")
         return
 
+    elapsed = asyncio.get_event_loop().time() - start
     alive = [p for p in results if p][:PROXY_POOL_MAX]
     if alive:
         _live_proxy_pool = alive
-        logger.info(f"Proxy pool refreshed: {len(alive)}/{len(candidates)} candidates alive.")
+        logger.info(f"Proxy pool refreshed: {len(alive)}/{len(candidates)} candidates alive ({elapsed:.1f}s).")
     else:
-        logger.warning(f"Proxy health-check found 0/{len(candidates)} alive; keeping previous pool.")
+        logger.warning(f"Proxy health-check found 0/{len(candidates)} alive ({elapsed:.1f}s); keeping previous pool.")
+
 
 async def proxy_refresh_loop() -> None:
     while True:
@@ -1538,11 +1542,10 @@ async def on_startup(app: Application) -> None:
     logger.info("Starting up...")
     await start_keepalive_server()
     if PROXY_AUTO_FETCH:
-        try:
-            # Bounded so a slow/broken proxy source can't hang startup.
-            await asyncio.wait_for(refresh_proxy_pool(), timeout=30)
-        except Exception as e:
-            logger.warning(f"Initial proxy pool refresh failed/timed out: {e}")
+        # Don't block bot startup on this — a free-proxy list can have
+        # hundreds of dead candidates and take well over a minute to
+        # health-check. The pool just starts empty (falling back to no
+        # proxy) until the first background refresh completes.
         app.create_task(proxy_refresh_loop(), update=True)
     app.create_task(polling_loop(app), update=True)
     logger.info("Bot startup complete.")
