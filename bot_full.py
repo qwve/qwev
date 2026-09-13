@@ -167,7 +167,7 @@ def is_authorized(user_id: int) -> bool:
 # LOGGING
 # ============================================================================
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -560,8 +560,10 @@ async def fetch_profile_pic_bytes(profile_pic_url: Optional[str]) -> Optional[by
     }
     try:
         timeout = aiohttp.ClientTimeout(total=10)
+        proxy = _pick_proxy()
+        logger.debug(f"Profile pic fetch using {proxy or 'direct (no proxy)'}")
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(profile_pic_url, headers=headers, proxy=_pick_proxy()) as resp:
+            async with session.get(profile_pic_url, headers=headers, proxy=proxy) as resp:
                 if resp.status == 200:
                     return await resp.read()
                 logger.warning(f"Profile picture fetch got HTTP {resp.status}")
@@ -769,8 +771,10 @@ async def check_instagram_status(username: str, retries: int = 2) -> CheckResult
     for attempt in range(retries + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+            proxy = _pick_proxy()
+            logger.debug(f"@{username}: checking via {proxy or 'direct (no proxy)'} (attempt {attempt+1})")
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(API_URL, json=payload, headers=headers, proxy=_pick_proxy()) as resp:
+                async with session.post(API_URL, json=payload, headers=headers, proxy=proxy) as resp:
                     status_code = resp.status
 
                     if status_code == 429:
