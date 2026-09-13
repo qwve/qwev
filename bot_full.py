@@ -93,13 +93,25 @@ CARDS_DIR.mkdir(parents=True, exist_ok=True)
 
 BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring").strip()
 
-# Comma-separated list of proxy URLs (e.g. http://user:pass@host:port). One
-# is chosen at random per outbound request. Empty/unset = no proxy, requests
-# go out directly.
-PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
+# ----------------------------------------------------------------------------
+# Proxy pool (see "PROXY POOL" section below for the fetch/health-check logic)
+# ----------------------------------------------------------------------------
+# Manually-supplied proxies (comma-separated http://[user:pass@]host:port).
+# Optional — these are merged with the auto-fetched free proxies below.
+PROXIES_STATIC = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 
-def _pick_proxy() -> Optional[str]:
-    return random.choice(PROXIES) if PROXIES else None
+# Auto-fetch free public proxies from a live list and health-check them
+# periodically instead of relying on a static, quickly-stale list.
+PROXY_AUTO_FETCH = os.getenv("PROXY_AUTO_FETCH", "true").strip().lower() not in ("false", "0", "no")
+PROXY_SOURCE_URL = os.getenv(
+    "PROXY_SOURCE_URL",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
+).strip()
+PROXY_REFRESH_INTERVAL_SECONDS = int(os.getenv("PROXY_REFRESH_INTERVAL_SECONDS", "600"))
+PROXY_HEALTHCHECK_URL = os.getenv("PROXY_HEALTHCHECK_URL", "http://httpbin.org/ip").strip()
+PROXY_HEALTHCHECK_TIMEOUT_SECONDS = int(os.getenv("PROXY_HEALTHCHECK_TIMEOUT_SECONDS", "6"))
+PROXY_HEALTHCHECK_CONCURRENCY = int(os.getenv("PROXY_HEALTHCHECK_CONCURRENCY", "30"))
+PROXY_POOL_MAX = int(os.getenv("PROXY_POOL_MAX", "30"))
 
 INTER_CHECK_DELAY_MS = 2000
 MAX_BULK_ADD = 25  # safety cap so one paste can't queue an unbounded number of checks
@@ -428,6 +440,99 @@ def make_circular(img: Image.Image, size: int) -> Image.Image:
     out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     out.paste(img, (0, 0), mask)
     return out
+
+# ============================================================================
+# PROXY POOL
+# ============================================================================
+# Free public proxy lists die fast (often within hours), so instead of a
+# fixed list we periodically pull a fresh candidate list from PROXY_SOURCE_URL,
+# health-check each candidate with a cheap request, and only rotate across
+# ones that actually responded. PROXIES_STATIC (from the PROXIES env var) is
+# merged in as extra candidates so manually-supplied proxies get used too.
+# If PROXY_AUTO_FETCH is off, or the fetch/health-check fails, we just fall
+# back to PROXIES_STATIC as-is (unchecked), and to no proxy if that's empty.
+_live_proxy_pool: list = list(PROXIES_STATIC)
+
+def _pick_proxy() -> Optional[str]:
+    return random.choice(_live_proxy_pool) if _live_proxy_pool else None
+
+async def _fetch_proxy_candidates() -> list:
+    """Pull a fresh list of free proxy candidates from PROXY_SOURCE_URL."""
+    candidates = list(PROXIES_STATIC)
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(PROXY_SOURCE_URL) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Proxy source fetch got HTTP {resp.status}")
+                    return candidates
+                text = await resp.text()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "." not in line or ":" not in line:
+                continue
+            candidates.append(line if "://" in line else f"http://{line}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch proxy source list: {e}")
+    # de-dupe, keep order
+    seen = set()
+    deduped = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+async def _proxy_is_alive(session: aiohttp.ClientSession, proxy: str, sem: asyncio.Semaphore) -> Optional[str]:
+    async with sem:
+        try:
+            timeout = aiohttp.ClientTimeout(total=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
+            async with session.get(PROXY_HEALTHCHECK_URL, proxy=proxy, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return proxy
+        except Exception:
+            pass
+        return None
+
+async def refresh_proxy_pool() -> None:
+    """Fetch fresh candidates, health-check them concurrently, and replace
+    the live pool with the ones that responded (capped at PROXY_POOL_MAX)."""
+    global _live_proxy_pool
+
+    if not PROXY_AUTO_FETCH:
+        _live_proxy_pool = list(PROXIES_STATIC)
+        return
+
+    candidates = await _fetch_proxy_candidates()
+    if not candidates:
+        logger.warning("No proxy candidates found; keeping previous pool.")
+        return
+
+    sem = asyncio.Semaphore(PROXY_HEALTHCHECK_CONCURRENCY)
+    try:
+        async with aiohttp.ClientSession() as session:
+            results = await asyncio.gather(
+                *[_proxy_is_alive(session, p, sem) for p in candidates],
+                return_exceptions=False,
+            )
+    except Exception as e:
+        logger.warning(f"Proxy health-check pass failed: {e}")
+        return
+
+    alive = [p for p in results if p][:PROXY_POOL_MAX]
+    if alive:
+        _live_proxy_pool = alive
+        logger.info(f"Proxy pool refreshed: {len(alive)}/{len(candidates)} candidates alive.")
+    else:
+        logger.warning(f"Proxy health-check found 0/{len(candidates)} alive; keeping previous pool.")
+
+async def proxy_refresh_loop() -> None:
+    while True:
+        try:
+            await refresh_proxy_pool()
+        except Exception as e:
+            logger.exception(f"Proxy pool refresh error: {e}")
+        await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
 
 # Shared browser-identity headers for every request to insta-story.com (the
 # API) AND the Instagram CDN image URLs it hands back — both are guarded by
@@ -1432,6 +1537,13 @@ async def polling_loop(app: Application) -> None:
 async def on_startup(app: Application) -> None:
     logger.info("Starting up...")
     await start_keepalive_server()
+    if PROXY_AUTO_FETCH:
+        try:
+            # Bounded so a slow/broken proxy source can't hang startup.
+            await asyncio.wait_for(refresh_proxy_pool(), timeout=30)
+        except Exception as e:
+            logger.warning(f"Initial proxy pool refresh failed/timed out: {e}")
+        app.create_task(proxy_refresh_loop(), update=True)
     app.create_task(polling_loop(app), update=True)
     logger.info("Bot startup complete.")
 
