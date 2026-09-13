@@ -93,6 +93,14 @@ CARDS_DIR.mkdir(parents=True, exist_ok=True)
 
 BOT_FOOTER_TEXT = os.getenv("BOT_FOOTER_TEXT", "Instagram Monitor — Premium Monitoring").strip()
 
+# Comma-separated list of proxy URLs (e.g. http://user:pass@host:port). One
+# is chosen at random per outbound request. Empty/unset = no proxy, requests
+# go out directly.
+PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
+
+def _pick_proxy() -> Optional[str]:
+    return random.choice(PROXIES) if PROXIES else None
+
 INTER_CHECK_DELAY_MS = 2000
 MAX_BULK_ADD = 25  # safety cap so one paste can't queue an unbounded number of checks
 
@@ -444,7 +452,7 @@ async def fetch_profile_pic_bytes(profile_pic_url: Optional[str]) -> Optional[by
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(profile_pic_url, headers=headers) as resp:
+            async with session.get(profile_pic_url, headers=headers, proxy=_pick_proxy()) as resp:
                 if resp.status == 200:
                     return await resp.read()
                 logger.warning(f"Profile picture fetch got HTTP {resp.status}")
@@ -653,7 +661,7 @@ async def check_instagram_status(username: str, retries: int = 2) -> CheckResult
         try:
             timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(API_URL, json=payload, headers=headers) as resp:
+                async with session.post(API_URL, json=payload, headers=headers, proxy=_pick_proxy()) as resp:
                     status_code = resp.status
 
                     if status_code == 429:
